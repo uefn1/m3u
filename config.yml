@@ -1,0 +1,15 @@
+# Release URLから.m3u8を生成する設定
+# 単一でも複数でもOK
+releases:
+  - url: https://github.com/uefn1/go-stream-capturer/releases/tag/rec-FIFA%2B-20261026-2137
+    output: playlist-FIFA.m3u8
+  # - url: https://github.com/uefn1/go-stream-capturer/releases/tag/rec-OTHER-20261027-0000
+  #   output: playlist-OTHER.m3u8
+
+# 共通設定
+settings:
+  segdur: 600.0      # プローブ失敗時のフォールバック(秒)
+  target: 610.0      # TARGETDURATION
+  concurrency: 20    # 並列数
+  prefer_mp4: true   # .mp4優先
+  no_probe: false    # trueでプローブスキップ(最速だが推定値)
