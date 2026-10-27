@@ -5,7 +5,6 @@ import json
 import math
 import subprocess
 import tempfile
-import urllib.request
 import urllib.parse
 
 def parse_release_url(release_url: str):
@@ -16,23 +15,8 @@ def parse_release_url(release_url: str):
     
     owner = match.group(1)
     repo = match.group(2)
-    # URLエンコードされている可能性があるためデコード（%2B -> + など）
-    raw_tag = match.group(3)
-    tag = urllib.parse.unquote(raw_tag)
+    tag = urllib.parse.unquote(match.group(3))
     return owner, repo, tag
-
-def get_release_assets(owner: str, repo: str, tag: str, token: str):
-    # GitHub API のパス用に再度適切にクォート
-    quoted_tag = urllib.parse.quote(tag, safe='')
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{quoted_tag}"
-    req = urllib.request.Request(api_url)
-    req.add_header("Accept", "application/vnd.github+json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    
-    with urllib.request.urlopen(req) as res:
-        data = json.loads(res.read().decode())
-    return data.get("assets", [])
 
 def clean_float(value_str: str):
     cleaned = value_str.strip().rstrip(",")
@@ -44,7 +28,7 @@ def clean_float(value_str: str):
         return None
 
 def get_duration_from_file(filepath: str) -> float:
-    # 方式1: ffmpeg で null 出力に流し込み、実際にデコードされた最後のタイムスタンプを取得（最も確実・壊れたTSにも対応）
+    # 方式1: ffmpeg で最後までデコードして実再生時間を算出
     cmd_ffmpeg = [
         "ffmpeg",
         "-nostats",
@@ -53,15 +37,14 @@ def get_duration_from_file(filepath: str) -> float:
         "-"
     ]
     res_ffmpeg = subprocess.run(cmd_ffmpeg, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # stderr の最終行付近から time=00:00:10.05 のような表記を正規表現で探す
     time_matches = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", res_ffmpeg.stderr)
     if time_matches:
         h, m, s = time_matches[-1]
-        calc_dur = int(h) * 3600 + int(m) * 60 + float(s)
-        if calc_dur > 0:
-            return calc_dur
+        dur = int(h) * 3600 + int(m) * 60 + float(s)
+        if dur > 0:
+            return dur
 
-    # 方式2: パケットの PTS から先頭と末尾の差分を計算（ストリームを限定せず全体で検索）
+    # 方式2: パケットの PTS (最初と最後) の差分
     cmd_packet = [
         "ffprobe",
         "-v", "error",
@@ -89,7 +72,7 @@ def get_duration_from_file(filepath: str) -> float:
         if diff > 0:
             return diff
 
-    # 方式3: 通常の format/stream duration
+    # 方式3: format/stream duration
     cmd_format = [
         "ffprobe",
         "-v", "error",
@@ -103,37 +86,11 @@ def get_duration_from_file(filepath: str) -> float:
         if val is not None and val > 0:
             return val
 
+    # デバッグ用に ffmpeg のエラーを出力
+    print(f"\n--- ffprobe/ffmpeg error output for {os.path.basename(filepath)} ---")
+    print(res_ffmpeg.stderr[-1000:] if res_ffmpeg.stderr else "No stderr output")
+    print("------------------------------------------------------------------\n")
     return None
-
-def get_duration(url: str, token: str) -> float:
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as response, open(tmp_path, "wb") as out_file:
-            out_file.write(response.read())
-
-        # ダウンロードしたファイルが小さすぎる（HTMLエラーページなどの場合）を検知
-        file_size = os.path.getsize(tmp_path)
-        if file_size < 1024:
-            with open(tmp_path, "r", errors="ignore") as f:
-                content = f.read()
-            raise ValueError(f"ファイルサイズが小さすぎます ({file_size} bytes): {content[:100]}")
-
-        duration = get_duration_from_file(tmp_path)
-        if duration is None or duration <= 0:
-            raise ValueError("秒数を特定できませんでした（PTS/Durationが取得不能）")
-        return duration
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
 
 def main():
     if len(sys.argv) < 2:
@@ -141,36 +98,66 @@ def main():
         sys.exit(1)
 
     release_url = sys.argv[1].strip()
-    token = os.environ.get("GITHUB_TOKEN", "")
-
     owner, repo, tag = parse_release_url(release_url)
-    print(f"ターゲット: {owner}/{repo} (Tag: {tag})")
+    repo_full = f"{owner}/{repo}"
+    print(f"ターゲット: {repo_full} (Tag: {tag})")
 
-    assets = get_release_assets(owner, repo, tag, token)
+    # gh CLI を使って Release のアセット一覧を取得（JSON形式）
+    gh_cmd = ["gh", "release", "view", tag, "--repo", repo_full, "--json", "assets"]
+    res = subprocess.run(gh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        print(f"gh release view に失敗しました: {res.stderr}")
+        sys.exit(1)
+
+    release_data = json.loads(res.stdout)
+    assets = release_data.get("assets", [])
 
     ts_assets = [a for a in assets if a["name"].endswith(".ts")]
     if not ts_assets:
         print("対象の .ts ファイルが見つかりませんでした。")
         sys.exit(1)
 
+    # 自然順ソート
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s["name"])]
 
     ts_assets.sort(key=natural_sort_key)
-    print(f"{len(ts_assets)} 個の .ts ファイルを解析します...")
+    print(f"{len(ts_assets)} 個の .ts ファイルをダウンロードして解析します...")
 
     durations = []
-    for asset in ts_assets:
-        name = asset["name"]
-        download_url = asset["browser_download_url"]
-        
-        try:
-            dur = get_duration(download_url, token)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for asset in ts_assets:
+            name = asset["name"]
+            # m3u8に記載するURL（パブリックリリースの直接DLリンク）
+            download_url = asset.get("apiUrl", f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag)}/{name}")
+            
+            # gh コマンドで安全にローカルにダウンロード
+            dl_cmd = [
+                "gh", "release", "download", tag,
+                "--repo", repo_full,
+                "--pattern", name,
+                "--dir", tmp_dir,
+                "--clobber"
+            ]
+            dl_res = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if dl_res.returncode != 0:
+                print(f"ダウンロード失敗: {name}\n{dl_res.stderr}")
+                sys.exit(1)
+
+            local_file = os.path.join(tmp_dir, name)
+            dur = get_duration_from_file(local_file)
+            
+            if dur is None or dur <= 0:
+                print(f"Error: {name} の秒数を特定できませんでした。")
+                sys.exit(1)
+
             print(f"- {name}: {dur:.3f} 秒")
             durations.append((name, download_url, dur))
-        except Exception as e:
-            print(f"Error fetching duration for {name}: {e}")
-            sys.exit(1)
+
+            # ディスク節約のため解析完了後に削除
+            if os.path.exists(local_file):
+                os.remove(local_file)
 
     target_duration = math.ceil(max(d[2] for d in durations))
 
