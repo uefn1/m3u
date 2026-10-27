@@ -26,58 +26,57 @@ def get_release_assets(owner: str, repo: str, tag: str, token: str):
         data = json.loads(res.read().decode())
     return data.get("assets", [])
 
-def get_pts(filepath: str, read_intervals: str) -> float:
-    """指定した区間のパケットからPTS（タイムスタンプ）を取得"""
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-read_intervals", read_intervals,
-        "-select_streams", "v:0",
-        "-show_entries", "packet=pts_time",
-        "-of", "csv=p=0",
-        filepath
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    lines = [line.strip() for line in res.stdout.strip().split("\n") if line.strip() and line.strip() != "N/A"]
-    
-    # 映像ストリームで取れなかった場合は音声ストリームで再試行
-    if not lines:
-        cmd[4] = "a:0"
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        lines = [line.strip() for line in res.stdout.strip().split("\n") if line.strip() and line.strip() != "N/A"]
-
-    if not lines:
+def clean_float(value_str: str):
+    """カンマや空白を除去して float に変換"""
+    cleaned = value_str.strip().rstrip(",")
+    if not cleaned or cleaned == "N/A":
         return None
-    return float(lines[0])
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 def get_duration_from_file(filepath: str) -> float:
-    """ローカルファイルからPTS差分またはコンテナ解析で正確な秒数を算出"""
-    # 1. パケット単位で先頭と末尾のタイムスタンプ差分を計算
+    """ローカルファイルからPTS差分から正確な秒数を算出"""
+    # 映像ストリームからPTSとpacket durationを取得
     cmd = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "packet=pts_time",
+        "-show_entries", "packet=pts_time,duration_time",
         "-of", "csv=p=0",
         filepath
     ]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip() and l.strip() != "N/A"]
-    
-    if not lines:
-        # 映像がなければ音声
-        cmd[2] = "a:0"
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip() and l.strip() != "N/A"]
+    raw_lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip()]
 
-    if lines:
-        first_pts = float(lines[0])
-        last_pts = float(lines[-1])
-        diff = last_pts - first_pts
+    # 映像がなければ音声ストリームを試行
+    if not raw_lines:
+        cmd[4] = "a:0"
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        raw_lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip()]
+
+    pts_list = []
+    for line in raw_lines:
+        parts = line.split(",")
+        pts = clean_float(parts[0]) if len(parts) > 0 else None
+        dur = clean_float(parts[1]) if len(parts) > 1 else 0.0
+        if dur is None:
+            dur = 0.0
+        if pts is not None:
+            pts_list.append((pts, dur))
+
+    if pts_list:
+        first_pts = pts_list[0][0]
+        last_pts = pts_list[-1][0]
+        last_dur = pts_list[-1][1]
+        
+        # 末尾PTS + 最後のパケットの持続時間 - 先頭PTS
+        diff = (last_pts + last_dur) - first_pts
         if diff > 0:
             return diff
 
-    # 2. 上記で取れなかった場合、通常のformat/stream durationを試行
+    # フォールバック: 通常の format/stream duration
     cmd_fallback = [
         "ffprobe",
         "-v", "error",
@@ -86,21 +85,14 @@ def get_duration_from_file(filepath: str) -> float:
         filepath
     ]
     res = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    vals = [v.strip() for v in res.stdout.strip().split("\n") if v.strip() and v.strip() != "N/A"]
-    for v in vals:
-        try:
-            val = float(v)
-            if val > 0:
-                return val
-        except ValueError:
-            continue
+    for v in res.stdout.strip().split("\n"):
+        val = clean_float(v)
+        if val is not None and val > 0:
+            return val
 
     return None
 
 def get_duration(url: str, token: str) -> float:
-    """
-    ファイルをダウンロードし、MPEG-TSのPTS（タイムスタンプ）から正確な秒数を測定する
-    """
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -109,7 +101,6 @@ def get_duration(url: str, token: str) -> float:
         tmp_path = tmp.name
 
     try:
-        # リダイレクトに対応してダウンロード
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req) as response, open(tmp_path, "wb") as out_file:
             out_file.write(response.read())
@@ -140,7 +131,6 @@ def main():
         print("対象の .ts ファイルが見つかりませんでした。")
         sys.exit(1)
 
-    # 自然順ソート（out-000.ts, out-001.ts...の順番を維持）
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s["name"])]
 
@@ -160,7 +150,6 @@ def main():
             print(f"Error fetching duration for {name}: {e}")
             sys.exit(1)
 
-    # 最大秒数の切り上げ（HLS仕様準拠）
     target_duration = math.ceil(max(d[2] for d in durations))
 
     m3u8_lines = [
@@ -171,7 +160,6 @@ def main():
     ]
 
     for name, download_url, dur in durations:
-        # 小数点以下3桁〜6桁で正確に記載
         m3u8_lines.append(f"#EXTINF:{dur:.3f},")
         m3u8_lines.append(download_url)
 
