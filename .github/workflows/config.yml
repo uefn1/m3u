@@ -1,0 +1,8 @@
+# m3u-gen/config.yml
+releases:
+    - url: https://github.com/uefn1/go-stream-capturer/releases/tag/rec-FIFA%2B-20261026-2137
+    output: playlist-FIFA.m3u8
+
+settings:
+  concurrency: 20
+  prefer_mp4: true
