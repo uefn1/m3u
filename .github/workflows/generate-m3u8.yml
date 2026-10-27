@@ -1,121 +1,50 @@
-name: Generate M3U8 from Release TS files
+name: Generate M3U8 from Release
 
 on:
   workflow_dispatch:
     inputs:
       release_url:
-        description: 'GitHub Release URL (例: https://github.com/owner/repo/releases/tag/v1.0.0)'
+        description: 'GitHub Release の URL (例: https://github.com/owner/repo/releases/tag/v1.0.0)'
         required: true
         type: string
-      playlist_name:
-        description: '作成するm3u8のファイル名'
-        required: false
-        default: 'index.m3u8'
-        type: string
-
-permissions:
-  contents: write # Releaseにファイルをアップロードするために必要
 
 jobs:
-  build-m3u8:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Releaseにm3u8を追加アップロードする場合に必要
+
     steps:
-      - name: Install dependencies (ffmpeg/ffprobe, jq)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg (ffprobe)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq
+          sudo apt-get install -y ffmpeg
 
-      - name: Parse Release URL and Fetch Assets
-        id: release_info
+      - name: Run script to generate m3u8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/generate_m3u8.py "${{ inputs.release_url }}"
+
+      # 作成した playlist.m3u8 をアーティファクトとしてダウンロード可能にする
+      - name: Upload m3u8 as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: playlist-m3u8
+          path: playlist.m3u8
+
+      # （任意）元の Release に playlist.m3u8 をそのまま添付したい場合
+      - name: Upload m3u8 to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_URL: ${{ inputs.release_url }}
         run: |
-          # URL形式のチェックとパース
-          # 例: https://github.com/OWNER/REPO/releases/tag/TAG
-          TAG=$(echo "$RELEASE_URL" | sed -E 's|.*/releases/tag/([^/]+).*|\1|')
-          REPO=$(echo "$RELEASE_URL" | sed -E 's|https?://[^/]+/([^/]+/[^/]+)/.*|\1|')
-
-          echo "Repository: $REPO"
-          echo "Tag: $TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-
-          # GitHub CLI を使用して指定されたReleaseのアセット情報を取得
-          gh release view "$TAG" --repo "$REPO" --json assets > assets.json
-
-      - name: Process TS files and Generate M3U8
-        id: generate
-        run: |
-          OUTPUT_M3U8="${{ inputs.playlist_name }}"
-          
-          # assets.json から out-*.ts に一致するファイルの URL と名前を抽出・ソート
-          # 必要に応じて out-*.ts の命名パターンを変更してください
-          jq -c '.assets[] | select(.name | test("^out-[0-9]+\\.ts$"))' assets.json | sort -k1,1 > ts_assets.jsonl
-
-          if [ ! -s ts_assets.jsonl ]; then
-            echo "::error::対象の.tsファイルが見つかりませんでした。"
-            exit 1
-          fi
-
-          echo "Generating $OUTPUT_M3U8..."
-          
-          # 一時ファイルにセグメント情報を収集
-          touch segments.tmp
-          max_duration=0
-
-          while IFS= read -r asset; do
-            name=$(echo "$asset" | jq -r '.name')
-            url=$(echo "$asset" | jq -r '.browser_download_url')
-
-            echo "Analyzing $name ..."
-            
-            # ffprobeで動画の長さを取得（ヘッダー/冒頭だけを読んで秒数を高速取得）
-            duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$url" || echo "0")
-            
-            if [ -z "$duration" ] || [ "$duration" = "N/A" ]; then
-              duration="0.000000"
-            fi
-            
-            echo "Duration: $duration s"
-
-            # 最大秒数（EXT-X-TARGETDURATION用）の計算
-            int_duration=$(printf "%.0f" "$duration")
-            if [ "$int_duration" -gt "$max_duration" ]; then
-              max_duration=$int_duration
-            fi
-
-            # m3u8のセグメントエントリを記述
-            echo "#EXTINF:$duration," >> segments.tmp
-            echo "$url" >> segments.tmp
-          done < ts_assets.jsonl
-
-          # ターゲット長は最低でも最大秒数+1（または四捨五入切り上げ）
-          target_duration=$((max_duration + 1))
-
-          # m3u8 ファイルの作成（ヘッダー）
-          cat <<EOF > "$OUTPUT_M3U8"
-#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:$target_duration
-#EXT-X-MEDIA-SEQUENCE:0
-EOF
-
-          # セグメント情報を結合
-          cat segments.tmp >> "$OUTPUT_M3U8"
-
-          # フッター（VOD終了タグ）
-          echo "#EXT-X-ENDLIST" >> "$OUTPUT_M3U8"
-
-          echo "Generated M3U8 successfully:"
-          cat "$OUTPUT_M3U8"
-
-      - name: Upload M3U8 to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ steps.release_info.outputs.repo }}
-          TAG: ${{ steps.release_info.outputs.tag }}
-          FILE_NAME: ${{ inputs.playlist_name }}
-        run: |
-          # 既に同名ファイルが存在する場合の上書き (--clobber) を指定
-          gh release upload "$TAG" "$FILE_NAME" --repo "$REPO" --clobber
+          gh release upload --repo "${{ github.repository }}" "${{ steps.extract_tag.outputs.tag }}" playlist.m3u8 --clobber || true
+        continue-on-error: true
