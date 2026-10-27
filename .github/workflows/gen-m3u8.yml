@@ -1,18 +1,234 @@
-name: Generate m3u8 from Release
+name: Generate m3u8 from Release (single yml)
+
 on:
   workflow_dispatch:
     inputs:
       release_url:
-        description: 'Release Tag URL'
+        description: 'Release URL (例: https://github.com/uefn1/go-stream-capturer/releases/tag/rec-FIFA%2B-20261026-2137)'
         required: true
         type: string
       output_name:
-        description: '出力ファイル名'
+        description: '出力m3u8名'
         required: false
         default: 'playlist.m3u8'
         type: string
   push:
     branches: [main]
-    paths: [config.yml, main.go, go.mod]
   release:
     types: [published]
+
+jobs:
+  gen-m3u8:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate VOD m3u8 (no fallback, auto TARGETDURATION)
+        env:
+          INPUT_URL: ${{ inputs.release_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'PY'
+          import os, re, json, struct, urllib.request, urllib.parse, sys
+          from concurrent.futures import ThreadPoolExecutor
+
+          release_url = os.environ.get("INPUT_URL", "").strip()
+          output_name = os.environ.get("OUTPUT_NAME") or os.environ.get("INPUT_OUTPUT") or "playlist.m3u8"
+          # fallback for dispatch default
+          if not output_name:
+              output_name = "playlist.m3u8"
+
+          # config via env or default release list inside yml (edit here for push mode)
+          DEFAULT_RELEASES = [
+              "https://github.com/uefn1/go-stream-capturer/releases/tag/rec-FIFA%2B-20261026-2137",
+          ]
+
+          urls_to_process = []
+          if release_url:
+              urls_to_process = [release_url]
+          else:
+              urls_to_process = DEFAULT_RELEASES
+
+          re_tag = re.compile(r"github\.com/([^/]+)/([^/]+)/releases/(?:tag|download)/([^/?#]+)")
+          re_dl  = re.compile(r"github\.com/([^/]+)/([^/]+)/releases/download/([^/?#]+)/")
+
+          def parse_url(input_url):
+              input_url = input_url.strip()
+              m = re_dl.search(input_url)
+              if m:
+                  owner, repo = m[1], m[2]
+                  tag = urllib.parse.unquote(m[3])
+                  base = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag, safe='')}/"
+                  return owner, repo, tag, base
+              m = re_tag.search(input_url)
+              if m:
+                  owner, repo = m[1], m[2]
+                  t = urllib.parse.unquote(m[3].split("/")[0])
+                  base = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(t, safe='')}/"
+                  return owner, repo, t, base
+              raise ValueError(f"URL parse failed: {input_url}")
+
+          def fetch_assets(owner, repo, tag, token):
+              api = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+              req = urllib.request.Request(api, headers={"Accept":"application/vnd.github+json"})
+              if token:
+                  req.add_header("Authorization", f"Bearer {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      data = json.loads(r.read().decode())
+                      return data.get("assets", [])
+              except Exception as e:
+                  print(f"API failed {e}, fallback to probe")
+                  return None
+
+          def parse_mvhd_duration(data: bytes):
+              # moov/mvhd search
+              off = 0
+              while off + 8 <= len(data):
+                  size = struct.unpack('>I', data[off:off+4])[0]
+                  if size < 8 or size > len(data)-off:
+                      break
+                  typ = data[off+4:off+8].decode(errors='ignore')
+                  if typ == 'moov':
+                      inner = off+8
+                      moov_end = off+size
+                      while inner+8 <= moov_end and inner+8 <= len(data):
+                          isize = struct.unpack('>I', data[inner:inner+4])[0]
+                          if isize < 8 or inner+isize > moov_end:
+                              break
+                          ityp = data[inner+4:inner+8].decode(errors='ignore')
+                          if ityp == 'mvhd':
+                              if inner+30 > len(data): break
+                              ver = data[inner+8]
+                              if ver == 1:
+                                  timescale = struct.unpack('>I', data[inner+28:inner+32])[0]
+                                  dur = struct.unpack('>Q', data[inner+32:inner+40])[0]
+                              else:
+                                  timescale = struct.unpack('>I', data[inner+20:inner+24])[0]
+                                  dur = struct.unpack('>I', data[inner+24:inner+28])[0]
+                              if timescale>0 and dur>0:
+                                  return dur/timescale
+                          inner += isize
+                  off += size
+              return 0
+
+          def get_duration_fast(url):
+              # 128KB + 512KB probe, no fallback
+              for rg in ["0-131071", "0-524287"]:
+                  try:
+                      req = urllib.request.Request(url, headers={"Range": f"bytes={rg}"})
+                      with urllib.request.urlopen(req, timeout=10) as r:
+                          buf = r.read(600*1024)
+                          d = parse_mvhd_duration(buf)
+                          if d>0 and d<100000:
+                              return d
+                  except Exception:
+                      continue
+              return 0
+
+          def probe_sequential(base, prefer_mp4=True):
+              exts = ["mp4","ts"] if prefer_mp4 else ["ts","mp4"]
+              for ext in exts:
+                  urls=[]
+                  fail=0
+                  for i in range(800):
+                      name=f"out-{i:03d}.{ext}"
+                      u=base+name
+                      try:
+                          req=urllib.request.Request(u, headers={"Range":"bytes=0-0"})
+                          with urllib.request.urlopen(req, timeout=8) as r:
+                              if r.status in (200,206):
+                                  urls.append(u); fail=0
+                              else:
+                                  if urls: fail+=1
+                      except Exception:
+                          if urls: fail+=1
+                      if urls and fail>=10: break
+                      if not urls and i>80: break
+                  if urls: return urls
+              return []
+
+          token = os.environ.get("GITHUB_TOKEN","")
+          for rel_url in urls_to_process:
+              print(f"\n=== {rel_url} ===")
+              owner, repo, tag, base = parse_url(rel_url)
+              assets = fetch_assets(owner, repo, tag, token)
+              urls=[]
+              if assets is None:
+                  urls = probe_sequential(base, True)
+              else:
+                  media = [a for a in assets if a.get("name","").lower().endswith((".mp4",".ts",".m4s"))]
+                  media.sort(key=lambda x: x.get("name",""))
+                  if not media:
+                      urls = probe_sequential(base, True)
+                  else:
+                      urls = [a.get("browser_download_url") for a in media]
+
+              if not urls:
+                  print("no files found, skip")
+                  continue
+
+              print(f"found {len(urls)} files, probing...")
+              durations=[0]*len(urls)
+              def task(idx_u):
+                  idx,u = idx_u
+                  d = get_duration_fast(u)
+                  print(f"  [{idx:03d}] {d:.3f}s" if d>0 else f"  [{idx:03d}] probe failed -> skip")
+                  return idx,d
+
+              with ThreadPoolExecutor(max_workers=20) as ex:
+                  for idx,d in ex.map(task, enumerate(urls)):
+                      durations[idx]=d
+
+              # filter failed, no fallback
+              filtered = [(u,d) for u,d in zip(urls,durations) if d>0]
+              if not filtered:
+                  print("ERROR: all probes failed, no m3u8 generated")
+                  sys.exit(1)
+
+              f_urls, f_durs = zip(*filtered)
+              total = sum(f_durs)
+              max_dur = max(f_durs)
+              target = int(max_dur + 1.5)
+              if target<1: target=1
+              is_fmp4 = f_urls[0].lower().endswith(".mp4")
+              ver = 7 if is_fmp4 else 3
+
+              out_name = output_name
+              # if multiple releases, make unique name
+              if len(urls_to_process)>1:
+                  safe_tag = re.sub(r'[^A-Za-z0-9_.-]+', '_', tag)
+                  out_name = f"playlist-{safe_tag}.m3u8"
+
+              with open(out_name, "w") as f:
+                  f.write("#EXTM3U\n")
+                  f.write(f"#EXT-X-VERSION:{ver}\n")
+                  f.write("#EXT-X-PLAYLIST-TYPE:VOD\n")
+                  f.write("#EXT-X-INDEPENDENT-SEGMENTS\n")
+                  f.write(f"#EXT-X-TARGETDURATION:{target}\n")
+                  f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
+                  f.write("#EXT-X-ALLOW-CACHE:YES\n")
+                  for u,d in zip(f_urls, f_durs):
+                      f.write(f"#EXTINF:{d:.3f},\n{u}\n")
+                  f.write("#EXT-X-ENDLIST\n")
+              print(f"generated {out_name} total {total:.1f}s ({total/60:.1f}min) {len(filtered)}/{len(urls)} ok, TARGET {target}")
+
+          PY
+
+      - name: Upload m3u8 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3u8-playlists
+          path: "*.m3u8"
+          if-no-files-found: warn
+
+      - name: Commit generated m3u8 to repo (push only)
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add *.m3u8 || true
+          git diff --cached --quiet || git commit -m "auto: update m3u8 [skip ci]" && git push || echo "no push"
