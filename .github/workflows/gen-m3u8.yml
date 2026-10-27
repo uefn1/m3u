@@ -1,0 +1,35 @@
+name: Generate m3u8 from Release
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: 'Release Tag URL'
+        required: true
+        type: string
+      output_name:
+        default: 'playlist.m3u8'
+  release:
+    types: [published]
+
+jobs:
+  gen-m3u8:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+            - run: |
+          if [ -f "config.yml" ]; then
+            go run . -config config.yml
+          else
+            go run . -url "${{ inputs.release_url }}" -o "${{ inputs.output_name }}"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - uses: actions/upload-artifact@v4
+        with:
+          name: m3u8-playlists
+          path: "*.m3u8"
