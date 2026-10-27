@@ -13,10 +13,18 @@ def parse_release_url(release_url: str):
     match = re.search(pattern, release_url)
     if not match:
         raise ValueError(f"無効な Release URL です: {release_url}")
-    return match.group(1), match.group(2), match.group(3)
+    
+    owner = match.group(1)
+    repo = match.group(2)
+    # URLエンコードされている可能性があるためデコード（%2B -> + など）
+    raw_tag = match.group(3)
+    tag = urllib.parse.unquote(raw_tag)
+    return owner, repo, tag
 
 def get_release_assets(owner: str, repo: str, tag: str, token: str):
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
+    # GitHub API のパス用に再度適切にクォート
+    quoted_tag = urllib.parse.quote(tag, safe='')
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{quoted_tag}"
     req = urllib.request.Request(api_url)
     req.add_header("Accept", "application/vnd.github+json")
     if token:
@@ -27,7 +35,6 @@ def get_release_assets(owner: str, repo: str, tag: str, token: str):
     return data.get("assets", [])
 
 def clean_float(value_str: str):
-    """カンマや空白を除去して float に変換"""
     cleaned = value_str.strip().rstrip(",")
     if not cleaned or cleaned == "N/A":
         return None
@@ -37,55 +44,61 @@ def clean_float(value_str: str):
         return None
 
 def get_duration_from_file(filepath: str) -> float:
-    """ローカルファイルからPTS差分から正確な秒数を算出"""
-    # 映像ストリームからPTSとpacket durationを取得
-    cmd = [
+    # 方式1: ffmpeg で null 出力に流し込み、実際にデコードされた最後のタイムスタンプを取得（最も確実・壊れたTSにも対応）
+    cmd_ffmpeg = [
+        "ffmpeg",
+        "-nostats",
+        "-i", filepath,
+        "-f", "null",
+        "-"
+    ]
+    res_ffmpeg = subprocess.run(cmd_ffmpeg, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # stderr の最終行付近から time=00:00:10.05 のような表記を正規表現で探す
+    time_matches = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", res_ffmpeg.stderr)
+    if time_matches:
+        h, m, s = time_matches[-1]
+        calc_dur = int(h) * 3600 + int(m) * 60 + float(s)
+        if calc_dur > 0:
+            return calc_dur
+
+    # 方式2: パケットの PTS から先頭と末尾の差分を計算（ストリームを限定せず全体で検索）
+    cmd_packet = [
         "ffprobe",
         "-v", "error",
-        "-select_streams", "v:0",
         "-show_entries", "packet=pts_time,duration_time",
         "-of", "csv=p=0",
         filepath
     ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    raw_lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip()]
-
-    # 映像がなければ音声ストリームを試行
-    if not raw_lines:
-        cmd[4] = "a:0"
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        raw_lines = [l.strip() for l in res.stdout.strip().split("\n") if l.strip()]
-
+    res_packet = subprocess.run(cmd_packet, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     pts_list = []
-    for line in raw_lines:
-        parts = line.split(",")
-        pts = clean_float(parts[0]) if len(parts) > 0 else None
-        dur = clean_float(parts[1]) if len(parts) > 1 else 0.0
-        if dur is None:
-            dur = 0.0
-        if pts is not None:
-            pts_list.append((pts, dur))
+    for line in res_packet.stdout.strip().split("\n"):
+        parts = line.strip().split(",")
+        if parts:
+            pts = clean_float(parts[0])
+            dur = clean_float(parts[1]) if len(parts) > 1 else 0.0
+            if dur is None:
+                dur = 0.0
+            if pts is not None:
+                pts_list.append((pts, dur))
 
     if pts_list:
         first_pts = pts_list[0][0]
         last_pts = pts_list[-1][0]
         last_dur = pts_list[-1][1]
-        
-        # 末尾PTS + 最後のパケットの持続時間 - 先頭PTS
         diff = (last_pts + last_dur) - first_pts
         if diff > 0:
             return diff
 
-    # フォールバック: 通常の format/stream duration
-    cmd_fallback = [
+    # 方式3: 通常の format/stream duration
+    cmd_format = [
         "ffprobe",
         "-v", "error",
         "-show_entries", "format=duration:stream=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         filepath
     ]
-    res = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for v in res.stdout.strip().split("\n"):
+    res_format = subprocess.run(cmd_format, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for v in res_format.stdout.strip().split("\n"):
         val = clean_float(v)
         if val is not None and val > 0:
             return val
@@ -93,7 +106,9 @@ def get_duration_from_file(filepath: str) -> float:
     return None
 
 def get_duration(url: str, token: str) -> float:
-    headers = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -104,6 +119,13 @@ def get_duration(url: str, token: str) -> float:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req) as response, open(tmp_path, "wb") as out_file:
             out_file.write(response.read())
+
+        # ダウンロードしたファイルが小さすぎる（HTMLエラーページなどの場合）を検知
+        file_size = os.path.getsize(tmp_path)
+        if file_size < 1024:
+            with open(tmp_path, "r", errors="ignore") as f:
+                content = f.read()
+            raise ValueError(f"ファイルサイズが小さすぎます ({file_size} bytes): {content[:100]}")
 
         duration = get_duration_from_file(tmp_path)
         if duration is None or duration <= 0:
