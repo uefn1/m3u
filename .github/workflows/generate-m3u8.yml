@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_url:
-        description: 'GitHub Release の URL (例: https://github.com/owner/repo/releases/tag/v1.0.0)'
+        description: 'GitHub Release の URL (例: https://github.com/uefn1/tmp-record2/releases/tag/rec-FIFA%2B-20261028-122)'
         required: true
         type: string
 
@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Releaseにm3u8を追加アップロードする場合に必要
+      contents: read # Releaseの閲覧・ダウンロードに必要
 
     steps:
       - name: Checkout repository
@@ -23,28 +23,19 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ffmpeg (ffprobe)
+      - name: Install ffmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Run script to generate m3u8
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/generate_m3u8.py "${{ inputs.release_url }}"
 
-      # 作成した playlist.m3u8 をアーティファクトとしてダウンロード可能にする
       - name: Upload m3u8 as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: playlist-m3u8
           path: playlist.m3u8
-
-      # （任意）元の Release に playlist.m3u8 をそのまま添付したい場合
-      - name: Upload m3u8 to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload --repo "${{ github.repository }}" "${{ steps.extract_tag.outputs.tag }}" playlist.m3u8 --clobber || true
-        continue-on-error: true
