@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Release MP4 連続再生プレイヤー</title>
+  <style>
+    :root {
+      --bg-color: #0f172a;
+      --card-bg: #1e293b;
+      --primary: #38bdf8;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+    body {
+      margin: 0;
+      padding: 20px;
+      background-color: var(--bg-color);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 900px;
+    }
+    h2 {
+      margin-top: 0;
+      font-size: 1.4rem;
+      color: var(--primary);
+    }
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 15px;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 12px 16px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: var(--card-bg);
+      color: #fff;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    input[type="text"]:focus {
+      border-color: var(--primary);
+    }
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 8px;
+      background: #0284c7;
+      color: #fff;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover {
+      background: #0369a1;
+    }
+    button:disabled {
+      background: #475569;
+      cursor: not-allowed;
+    }
+    
+    .video-wrapper {
+      position: relative;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5);
+    }
+    video {
+      width: 100%;
+      display: block;
+      max-height: 70vh;
+    }
+
+    /* カスタム統合シークバー */
+    .controls {
+      background: var(--card-bg);
+      padding: 12px 16px;
+      border-radius: 0 0 12px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .seekbar-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    input[type="range"] {
+      flex: 1;
+      accent-color: var(--primary);
+      cursor: pointer;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    #status {
+      margin-top: 10px;
+      font-size: 0.9rem;
+      color: #38bdf8;
+    }
+    .playlist-info {
+      margin-top: 15px;
+      background: var(--card-bg);
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 150px;
+      overflow-y: auto;
+      font-size: 0.85rem;
+    }
+    .playlist-info ol {
+      margin: 0;
+      padding-left: 20px;
+    }
+    .playlist-info li.active {
+      color: var(--primary);
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>GitHub Release 連続再生プレイヤー (MP4)</h2>
+
+  <div class="input-group">
+    <input type="text" id="releaseUrl" placeholder="GitHub Release の URL を貼り付け (例: https://github.com/uefn1/files/releases/tag/...)">
+    <button id="loadBtn" onclick="loadRelease()">読み込み</button>
+  </div>
+
+  <div class="video-wrapper">
+    <video id="videoPlayer" playsinline></video>
+    <div class="controls">
+      <div class="seekbar-row">
+        <button id="playPauseBtn" style="padding: 6px 14px;" onclick="togglePlay()">再生</button>
+        <input type="range" id="globalSeekBar" min="0" value="0" step="0.1" oninput="onSeekInput()" onchange="onSeekChange()">
+        <span id="timeDisplay">00:00 / 00:00</span>
+      </div>
+      <div class="info-row">
+        <span id="currentVideoName">動画未読込</span>
+        <span id="segmentCount">0 / 0 ファイル</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="playlist-info">
+    <div style="font-weight: bold; margin-bottom: 6px; color: #cbd5e1;">ファイルリスト:</div>
+    <ol id="fileList"></ol>
+  </div>
+</div>
+
+<script>
+  let playlist = []; // { name, url, duration, startOffset }
+  let currentIndex = 0;
+  let totalDuration = 0;
+  let isSeeking = false;
+
+  const video = document.getElementById('videoPlayer');
+  const seekBar = document.getElementById('globalSeekBar');
+  const timeDisplay = document.getElementById('timeDisplay');
+  const currentVideoName = document.getElementById('currentVideoName');
+  const segmentCount = document.getElementById('segmentCount');
+  const statusDiv = document.getElementById('status');
+  const fileListEl = document.getElementById('fileList');
+  const playPauseBtn = document.getElementById('playPauseBtn');
+  const loadBtn = document.getElementById('loadBtn');
+
+  // URLから owner, repo, tag を抽出
+  function parseReleaseUrl(url) {
+    const match = url.match(/github\.com\/([^/]+)\/([^/]+)\/releases\/tag\/([^/?#]+)/);
+    if (!match) return null;
+    return {
+      owner: match[1],
+      repo: match[2],
+      tag: decodeURIComponent(match[3])
+    };
+  }
+
+  // 秒数を mm:ss 形式に整形
+  function formatTime(seconds) {
+    if (isNaN(seconds) || seconds < 0) return "00:00";
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+
+  // Release内のアセット一覧を取得してプレイリスト化
+  async function loadRelease() {
+    const urlInput = document.getElementById('releaseUrl').value.trim();
+    const parsed = parseReleaseUrl(urlInput);
+
+    if (!parsed) {
+      alert("有効な GitHub Release の URL を入力してください。");
+      return;
+    }
+
+    loadBtn.disabled = true;
+    statusDiv.textContent = "Release 情報を取得中...";
+    playlist = [];
+    fileListEl.innerHTML = "";
+
+    try {
+      const apiUrl = `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/releases/tags/${encodeURIComponent(parsed.tag)}`;
+      const res = await fetch(apiUrl);
+      if (!res.ok) {
+        throw new Error(`GitHub API エラー (${res.status}): Release が見つからないか、公開設定を確認してください。`);
+      }
+
+      const data = await res.json();
+      const assets = data.assets || [];
+
+      // .mp4 を抽出
+      let mp4Files = assets.filter(a => a.name.toLowerCase().endsWith('.mp4'));
+      if (mp4Files.length === 0) {
+        throw new Error("この Release には .mp4 ファイルが存在しません。");
+      }
+
+      // 自然順（out-000.mp4, out-001.mp4 ...）にソート
+      mp4Files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+
+      statusDiv.textContent = `${mp4Files.length} 個のファイルを検出。各動画の再生時間を計測中...`;
+
+      // 各 MP4 のメタデータ（Duration）を非同期取得
+      playlist = mp4Files.map(a => ({
+        name: a.name,
+        url: a.browser_download_url,
+        duration: 0,
+        startOffset: 0
+      }));
+
+      renderList();
+
+      // 各ファイルの秒数をブラウザ側でメタデータ読み込み
+      totalDuration = 0;
+      for (let i = 0; i < playlist.length; i++) {
+        statusDiv.textContent = `再生時間取得中: [${i + 1}/${playlist.length}] ${playlist[i].name}`;
+        playlist[i].startOffset = totalDuration;
+        const dur = await fetchDuration(playlist[i].url);
+        playlist[i].duration = dur;
+        totalDuration += dur;
+      }
+
+      seekBar.max = totalDuration;
+      statusDiv.textContent = `準備完了！ 全体再生時間: ${formatTime(totalDuration)}`;
+      updateDisplay();
+
+      // 最初のファイルを読み込み
+      currentIndex = 0;
+      loadSegment(0, 0, false);
+
+    } catch (err) {
+      statusDiv.textContent = `エラー: ${err.message}`;
+    } finally {
+      loadBtn.disabled = false;
+    }
+  }
+
+  // 動画ヘッダーのみを取得して Duration を算出
+  function fetchDuration(url) {
+    return new Promise((resolve) => {
+      const tempVideo = document.createElement('video');
+      tempVideo.preload = "metadata";
+      tempVideo.src = url;
+      tempVideo.onloadedmetadata = () => {
+        const d = tempVideo.duration;
+        resolve(isFinite(d) && d > 0 ? d : 10); // 取得不可時は仮で10秒
+        tempVideo.src = "";
+      };
+      tempVideo.onerror = () => {
+        resolve(10); // エラー時も停止させず10秒と仮定
+        tempVideo.src = "";
+      };
+    });
+  }
+
+  function renderList() {
+    fileListEl.innerHTML = "";
+    playlist.forEach((item, idx) => {
+      const li = document.createElement('li');
+      li.id = `item-${idx}`;
+      li.textContent = `${item.name}`;
+      li.style.cursor = "pointer";
+      li.onclick = () => {
+        loadSegment(idx, 0, true);
+      };
+      fileListEl.appendChild(li);
+    });
+  }
+
+  // 指定インデックスの動画を再生
+  function loadSegment(index, seekOffsetSeconds = 0, autoplay = true) {
+    if (index < 0 || index >= playlist.length) return;
+    currentIndex = index;
+
+    document.querySelectorAll('#fileList li').forEach(el => el.classList.remove('active'));
+    const activeEl = document.getElementById(`item-${index}`);
+    if (activeEl) activeEl.classList.add('active');
+
+    const item = playlist[index];
+    video.src = item.url;
+    currentVideoName.textContent = item.name;
+    segmentCount.textContent = `${index + 1} / ${playlist.length}`;
+
+    video.onloadedmetadata = () => {
+      if (seekOffsetSeconds > 0) {
+        video.currentTime = seekOffsetSeconds;
+      }
+      if (autoplay) {
+        video.play().catch(() => {});
+      }
+    };
+  }
+
+  // 現在のファイルが終了したら次のファイルへ自動遷移
+  video.addEventListener('ended', () => {
+    if (currentIndex + 1 < playlist.length) {
+      loadSegment(currentIndex + 1, 0, true);
+    } else {
+      statusDiv.textContent = "すべての再生が完了しました。";
+    }
+  });
+
+  // 全体タイムバーの更新
+  video.addEventListener('timeupdate', () => {
+    if (isSeeking || playlist.length === 0) return;
+    const globalTime = (playlist[currentIndex]?.startOffset || 0) + video.currentTime;
+    seekBar.value = globalTime;
+    updateDisplay(globalTime);
+  });
+
+  function updateDisplay(currentGlobalTime = 0) {
+    timeDisplay.textContent = `${formatTime(currentGlobalTime)} / ${formatTime(totalDuration)}`;
+  }
+
+  // シーク操作
+  function onSeekInput() {
+    isSeeking = true;
+    updateDisplay(parseFloat(seekBar.value));
+  }
+
+  function onSeekChange() {
+    const targetGlobalTime = parseFloat(seekBar.value);
+    
+    // どのファイルに該当するか判定
+    let targetIndex = 0;
+    for (let i = 0; i < playlist.length; i++) {
+      const start = playlist[i].startOffset;
+      const end = start + playlist[i].duration;
+      if (targetGlobalTime >= start && (targetGlobalTime < end || i === playlist.length - 1)) {
+        targetIndex = i;
+        break;
+      }
+    }
+
+    const localOffset = targetGlobalTime - playlist[targetIndex].startOffset;
+
+    if (targetIndex === currentIndex) {
+      video.currentTime = localOffset;
+    } else {
+      loadSegment(targetIndex, localOffset, !video.paused);
+    }
+    isSeeking = false;
+  }
+
+  // 再生/一時停止
+  function togglePlay() {
+    if (video.paused) {
+      video.play();
+    } else {
+      video.pause();
+    }
+  }
+
+  video.addEventListener('play', () => { playPauseBtn.textContent = "一時停止"; });
+  video.addEventListener('pause', () => { playPauseBtn.textContent = "再生"; });
+
+  // URLパラメータ（?url=...）で開いた場合に自動入力＆取得
+  window.addEventListener('DOMContentLoaded', () => {
+    const params = new URLSearchParams(window.location.search);
+    const url = params.get('url');
+    if (url) {
+      document.getElementById('releaseUrl').value = url;
+      loadRelease();
+    }
+  });
+</script>
+
+</body>
+</html>
