@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_url:
-        description: 'GitHub Release の URL (例: https://github.com/uefn1/tmp-record2/releases/tag/rec-FIFA%2B-20261028-122)'
+        description: 'GitHub Release の URL (例: https://github.com/uefn1/files/releases/tag/mp4-rec-Tigo-20261028-720-20261028130840)'
         required: true
         type: string
 
@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Release への .m3u8 のアップロードに必要
+      contents: write # 実行元リポジトリへの Release 作成・アップロードに必須
 
     steps:
       - name: Checkout repository
@@ -35,26 +35,24 @@ jobs:
         run: |
           python scripts/generate_m3u8.py "${{ inputs.release_url }}"
 
-      # URL からリポジトリとタグ名を抽出し、元の Release に .m3u8 を単体ファイルとしてアップロード
-      - name: Upload .m3u8 directly to Release
+      # 実行元リポジトリ自身の Release に .m3u8 単体をアップロード（無ければ Release を自動作成）
+      - name: Upload .m3u8 to Current Repo Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # URL から repo (owner/repo) と tag を抽出
           RELEASE_URL="${{ inputs.release_url }}"
-          REPO=$(echo "$RELEASE_URL" | sed -E 's|https?://github.com/([^/]+/[^/]+)/releases/tag/.*|\1|')
           RAW_TAG=$(echo "$RELEASE_URL" | sed -E 's|https?://github.com/[^/]+/[^/]+/releases/tag/([^/?#]+).*|\1|')
-          
-          # URLデコード (%2B -> + など)
           TAG=$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$RAW_TAG")
 
-          echo "Target Repo: $REPO"
           echo "Target Tag: $TAG"
+          echo "Target Repo: ${{ github.repository }}"
 
-          # Releaseに .m3u8 を直接アタッチ (--clobber で同名があれば上書き)
-          gh release upload "$TAG" playlist.m3u8 --repo "$REPO" --clobber
+          # 既に同名の Release があれば playlist.m3u8 を追加・上書きアップロード
+          # 無ければ新規に Release を作成して playlist.m3u8 を添付
+          gh release upload "$TAG" playlist.m3u8 --repo "${{ github.repository }}" --clobber || \
+          gh release create "$TAG" playlist.m3u8 --repo "${{ github.repository }}" --title "$TAG" --notes "Generated M3U8 for $TAG"
 
-      # （念のためのバックアップとして Actions の Artifacts にも保存）
+      # バックアップとして Actions 側の Artifact にも保存（zip形式）
       - name: Upload m3u8 as Artifact (Backup)
         uses: actions/upload-artifact@v4
         with:
