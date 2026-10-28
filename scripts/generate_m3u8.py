@@ -40,7 +40,6 @@ def get_mp4_duration(filepath: str) -> float:
         except ValueError:
             pass
 
-    # メタデータが取得できない・壊れている場合の最低限のフォールバック (ストリーム側をチェック)
     cmd_stream = [
         "ffprobe",
         "-v", "error",
@@ -81,7 +80,7 @@ def main():
     release_data = json.loads(res.stdout)
     assets = release_data.get("assets", [])
 
-    # .mp4 ファイルのみを抽出（初期化セグメント等は除外し、通常のmp4のみ）
+    # .mp4 ファイルのみを抽出
     mp4_assets = [a for a in assets if a["name"].lower().endswith(".mp4")]
     if not mp4_assets:
         print("対象の .mp4 ファイルが見つかりませんでした。")
@@ -101,7 +100,6 @@ def main():
     with tempfile.TemporaryDirectory() as tmp_dir:
         for idx, asset in enumerate(mp4_assets, 1):
             name = asset["name"]
-            # 元のReleaseの直ダウンロードリンクURL
             download_url = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag)}/{name}"
             local_file = os.path.join(tmp_dir, name)
 
@@ -158,6 +156,4 @@ def main():
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write("\n".join(m3u8_lines) + "\n")
 
-    print(f"\nすべての解析が完了しました。{output_filename} を正常に作成しました。")
-
-if __name__ == "__main__":
+    pri
