@@ -8,6 +8,7 @@ import tempfile
 import urllib.parse
 
 def parse_release_url(release_url: str):
+    """Release URLから owner, repo, tag を抽出"""
     pattern = r"github\.com/([^/]+)/([^/]+)/releases/tag/([^/?#]+)"
     match = re.search(pattern, release_url)
     if not match:
@@ -18,46 +19,45 @@ def parse_release_url(release_url: str):
     tag = urllib.parse.unquote(match.group(3))
     return owner, repo, tag
 
-def clean_float(value_str: str):
-    cleaned = value_str.strip().rstrip(",")
-    if not cleaned or cleaned == "N/A":
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-def get_duration_from_file(filepath: str) -> float:
-    """単体再生可能なMP4から正確な秒数を取得"""
-    # 方式1: format / stream duration (通常の完全なMP4なら一瞬で正確に取れる)
-    cmd_format = [
+def get_mp4_duration(filepath: str) -> float:
+    """
+    独立した完全な MP4 ファイルからメタデータ (moov) の再生秒数を取得
+    """
+    cmd = [
         "ffprobe",
         "-v", "error",
-        "-show_entries", "format=duration:stream=duration",
+        "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         filepath
     ]
-    res_format = subprocess.run(cmd_format, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for v in res_format.stdout.strip().split("\n"):
-        val = clean_float(v)
-        if val is not None and val > 0:
-            return val
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    val = res.stdout.strip().rstrip(",")
+    if val and val != "N/A":
+        try:
+            dur = float(val)
+            if dur > 0:
+                return dur
+        except ValueError:
+            pass
 
-    # 方式2: ffmpeg による空デコード (メタデータが壊れている場合のフォールバック)
-    cmd_ffmpeg = [
-        "ffmpeg",
-        "-nostats",
-        "-i", filepath,
-        "-f", "null",
-        "-"
+    # メタデータが取得できない・壊れている場合の最低限のフォールバック (ストリーム側をチェック)
+    cmd_stream = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        filepath
     ]
-    res_ffmpeg = subprocess.run(cmd_ffmpeg, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    time_matches = re.findall(r"time=(\d+):(\d+):(\d+\.\d+)", res_ffmpeg.stderr)
-    if time_matches:
-        h, m, s = time_matches[-1]
-        dur = int(h) * 3600 + int(m) * 60 + float(s)
-        if dur > 0:
-            return dur
+    res_stream = subprocess.run(cmd_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    val_stream = res_stream.stdout.strip().rstrip(",")
+    if val_stream and val_stream != "N/A":
+        try:
+            dur = float(val_stream)
+            if dur > 0:
+                return dur
+        except ValueError:
+            pass
 
     return None
 
@@ -81,32 +81,33 @@ def main():
     release_data = json.loads(res.stdout)
     assets = release_data.get("assets", [])
 
-    # .mp4 ファイルを抽出
+    # .mp4 ファイルのみを抽出（初期化セグメント等は除外し、通常のmp4のみ）
     mp4_assets = [a for a in assets if a["name"].lower().endswith(".mp4")]
     if not mp4_assets:
         print("対象の .mp4 ファイルが見つかりませんでした。")
         sys.exit(1)
 
-    # 自然順ソート (out-000.mp4, out-001.mp4 等)
+    # 自然順ソート（out-000.mp4, out-001.mp4 ...）
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s["name"])]
 
     mp4_assets.sort(key=natural_sort_key)
     total_count = len(mp4_assets)
-    print(f"合計 {total_count} 個の単体再生可能 .mp4 ファイルを解析します...\n")
+    print(f"合計 {total_count} 個の単体再生可能 .mp4 ファイルを順次解析します...\n")
 
     durations = []
 
+    # 1ファイルずつ「ダウンロード → 秒数取得 → 即時キャッシュ削除」
     with tempfile.TemporaryDirectory() as tmp_dir:
         for idx, asset in enumerate(mp4_assets, 1):
             name = asset["name"]
-            # 元のReleaseの直ダウンロードリンク
+            # 元のReleaseの直ダウンロードリンクURL
             download_url = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag)}/{name}"
             local_file = os.path.join(tmp_dir, name)
 
             print(f"[{idx}/{total_count}] ダウンロード中: {name}")
 
-            # 1. 1ファイルずつダウンロード
+            # 該当ファイルのみダウンロード
             dl_cmd = [
                 "gh", "release", "download", tag,
                 "--repo", repo_full,
@@ -119,24 +120,24 @@ def main():
                 print(f"ダウンロード失敗: {name}\n{dl_res.stderr}")
                 sys.exit(1)
 
-            # 2. 秒数を取得
+            # 秒数を取得
             try:
-                dur = get_duration_from_file(local_file)
+                dur = get_mp4_duration(local_file)
                 if dur is None or dur <= 0:
                     print(f"  -> 秒数が特定できなかったため、代替値 10.0 秒を適用します。")
                     dur = 10.0
                 else:
-                    print(f"  -> 秒数: {dur:.3f} 秒")
+                    print(f"  -> 再生時間: {dur:.3f} 秒")
                 durations.append((name, download_url, dur))
             finally:
-                # 3. 即座にディスクからキャッシュ削除
+                # 解析完了後、即座にローカルファイルを完全削除（ディスク容量を解放）
                 if os.path.exists(local_file):
                     os.remove(local_file)
                     print(f"  -> キャッシュ削除完了: {name}")
 
     target_duration = math.ceil(max(d[2] for d in durations))
 
-    # 単体再生可能 MP4 用の m3u8 ヘッダー
+    # 独立した MP4 セグメント用の HLS プレイリスト構築
     m3u8_lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:6",
@@ -145,7 +146,7 @@ def main():
     ]
 
     for idx, (name, download_url, dur) in enumerate(durations):
-        # 2つ目以降の独立したMP4ファイルの前には、ヘッダーの再読み込みを促す DISCONTINUITY を挿入
+        # 独立したMP4同士の境界にはヘッダー再初期化用の DISCONTINUITY を挿入
         if idx > 0:
             m3u8_lines.append("#EXT-X-DISCONTINUITY")
         m3u8_lines.append(f"#EXTINF:{dur:.3f},")
@@ -157,7 +158,6 @@ def main():
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write("\n".join(m3u8_lines) + "\n")
 
-    print(f"\nすべての解析が完了しました。{output_filename} を作成しました。")
+    print(f"\nすべての解析が完了しました。{output_filename} を正常に作成しました。")
 
 if __name__ == "__main__":
-    main()
