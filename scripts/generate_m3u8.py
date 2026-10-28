@@ -28,88 +28,23 @@ def clean_float(value_str: str):
     except ValueError:
         return None
 
-def parse_fps(fps_str: str) -> float:
-    """r_frame_rate や avg_frame_rate (例: '30/1' や '30000/1001') を float に変換"""
-    if not fps_str or fps_str == "N/A" or fps_str == "0/0":
-        return None
-    try:
-        return float(fractions.Fraction(fps_str))
-    except Exception:
-        return None
-
-def get_duration_from_frames(filepath: str) -> float:
-    """
-    PTS/Duration が無い場合の強力なフォールバック:
-    フレーム数（または音声サンプル数）を直接カウントして秒数を計算する
-    """
-    cmd = [
+def get_duration_from_file(filepath: str) -> float:
+    """MP4ファイルから秒数を取得"""
+    # 方式1: format / stream duration (MP4はmoovに正確な秒数があるためこれが最も確実)
+    cmd_format = [
         "ffprobe",
         "-v", "error",
-        "-count_frames",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=nb_read_frames,r_frame_rate,avg_frame_rate",
-        "-of", "json",
-        filepath
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        data = json.loads(res.stdout)
-        streams = data.get("streams", [])
-        if streams:
-            stream = streams[0]
-            frames = int(stream.get("nb_read_frames", 0))
-            fps = parse_fps(stream.get("avg_frame_rate")) or parse_fps(stream.get("r_frame_rate"))
-            if frames > 0 and fps and fps > 0:
-                calc_dur = frames / fps
-                return calc_dur
-    except Exception:
-        pass
-
-    # 映像で取れなければ音声のサンプル数から計算
-    cmd_audio = [
-        "ffprobe",
-        "-v", "error",
-        "-count_packets",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=sample_rate,duration_ts,nb_read_packets",
-        "-show_entries", "format=duration",
-        "-of", "json",
-        filepath
-    ]
-    res_audio = subprocess.run(cmd_audio, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    try:
-        data = json.loads(res_audio.stdout)
-        streams = data.get("streams", [])
-        if streams:
-            stream = streams[0]
-            sr = int(stream.get("sample_rate", 0))
-            # duration_ts (タイムスタンプティック数) があれば
-            dur_ts = clean_float(str(stream.get("duration_ts", "")))
-            if dur_ts and sr > 0:
-                return dur_ts / sr
-    except Exception:
-        pass
-
-    # 最終手段: ビットレートとファイルサイズから概算
-    cmd_bitrate = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=bit_rate",
+        "-show_entries", "format=duration:stream=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         filepath
     ]
-    res_bitrate = subprocess.run(cmd_bitrate, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    bitrate = clean_float(res_bitrate.stdout)
-    if bitrate and bitrate > 0:
-        file_size_bytes = os.path.getsize(filepath)
-        calc_dur = (file_size_bytes * 8) / bitrate
-        if calc_dur > 0:
-            return calc_dur
+    res_format = subprocess.run(cmd_format, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for v in res_format.stdout.strip().split("\n"):
+        val = clean_float(v)
+        if val is not None and val > 0:
+            return val
 
-    return None
-
-def get_duration_from_file(filepath: str) -> float:
-    # 方式1: ffmpeg で最後まで空デコードして進捗タイムスタンプを取得
+    # 方式2: ffmpeg による空デコード (破損・不完全なMP4のフォールバック)
     cmd_ffmpeg = [
         "ffmpeg",
         "-nostats",
@@ -125,7 +60,7 @@ def get_duration_from_file(filepath: str) -> float:
         if dur > 0:
             return dur
 
-    # 方式2: パケットの PTS (最初と最後) の差分
+    # 方式3: パケットPTS差分
     cmd_packet = [
         "ffprobe",
         "-v", "error",
@@ -146,31 +81,9 @@ def get_duration_from_file(filepath: str) -> float:
                 pts_list.append((pts, dur))
 
     if pts_list:
-        first_pts = pts_list[0][0]
-        last_pts = pts_list[-1][0]
-        last_dur = pts_list[-1][1]
-        diff = (last_pts + last_dur) - first_pts
+        diff = (pts_list[-1][0] + pts_list[-1][1]) - pts_list[0][0]
         if diff > 0:
             return diff
-
-    # 方式3: format/stream duration
-    cmd_format = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration:stream=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        filepath
-    ]
-    res_format = subprocess.run(cmd_format, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for v in res_format.stdout.strip().split("\n"):
-        val = clean_float(v)
-        if val is not None and val > 0:
-            return val
-
-    # 方式4: 【新設】PTS/Duration が一切存在しない場合のフォールバック（フレーム数やサンプル数から算出）
-    fallback_dur = get_duration_from_frames(filepath)
-    if fallback_dur and fallback_dur > 0:
-        return fallback_dur
 
     return None
 
@@ -184,7 +97,7 @@ def main():
     repo_full = f"{owner}/{repo}"
     print(f"ターゲット: {repo_full} (Tag: {tag})")
 
-    # gh CLI を使って Release のアセット一覧を取得
+    # gh CLI で Release のアセット一覧を取得
     gh_cmd = ["gh", "release", "view", tag, "--repo", repo_full, "--json", "assets"]
     res = subprocess.run(gh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -194,27 +107,40 @@ def main():
     release_data = json.loads(res.stdout)
     assets = release_data.get("assets", [])
 
-    ts_assets = [a for a in assets if a["name"].endswith(".ts")]
-    if not ts_assets:
-        print("対象の .ts ファイルが見つかりませんでした。")
+    # .mp4 ファイルを抽出
+    all_mp4_assets = [a for a in assets if a["name"].lower().endswith(".mp4")]
+    if not all_mp4_assets:
+        print("対象の .mp4 ファイルが見つかりませんでした。")
         sys.exit(1)
 
-    # 自然順ソート
+    # fMP4 用の初期化セグメント (init.mp4 など) があれば検知
+    init_asset = None
+    media_mp4_assets = []
+    for a in all_mp4_assets:
+        if a["name"].lower() in ["init.mp4", "init.mp4f"]:
+            init_asset = a
+        else:
+            media_mp4_assets.append(a)
+
+    # 自然順ソート (out-000.mp4, out-001.mp4 等)
     def natural_sort_key(s):
         return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s["name"])]
 
-    ts_assets.sort(key=natural_sort_key)
-    print(f"{len(ts_assets)} 個の .ts ファイルをダウンロードして解析します...")
+    media_mp4_assets.sort(key=natural_sort_key)
+    total_count = len(media_mp4_assets)
+    print(f"合計 {total_count} 個の .mp4 ファイルを 1つずつダウンロード → 秒数解析 → キャッシュ削除 します...\n")
 
     durations = []
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        for asset in ts_assets:
+        for idx, asset in enumerate(media_mp4_assets, 1):
             name = asset["name"]
-            # パブリックリリースの直接ダウンロードURL
             download_url = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag)}/{name}"
-            
-            # gh release download で確実にダウンロード
+            local_file = os.path.join(tmp_dir, name)
+
+            print(f"[{idx}/{total_count}] ダウンロード中: {name}")
+
+            # 1. 個別ダウンロード
             dl_cmd = [
                 "gh", "release", "download", tag,
                 "--repo", repo_full,
@@ -227,28 +153,36 @@ def main():
                 print(f"ダウンロード失敗: {name}\n{dl_res.stderr}")
                 sys.exit(1)
 
-            local_file = os.path.join(tmp_dir, name)
-            dur = get_duration_from_file(local_file)
-            
-            # 万が一どの手段でも取れなかった場合のセーフガード（デフォルト10秒とするなど）
-            if dur is None or dur <= 0:
-                print(f"Warning: {name} の秒数が特定できなかったため、代替値 10.0 秒を適用します。")
-                dur = 10.0
-
-            print(f"- {name}: {dur:.3f} 秒")
-            durations.append((name, download_url, dur))
-
-            if os.path.exists(local_file):
-                os.remove(local_file)
+            # 2. 秒数を取得
+            try:
+                dur = get_duration_from_file(local_file)
+                if dur is None or dur <= 0:
+                    print(f"  -> 秒数が特定できなかったため、代替値 10.0 秒を適用します。")
+                    dur = 10.0
+                else:
+                    print(f"  -> 秒数: {dur:.3f} 秒")
+                durations.append((name, download_url, dur))
+            finally:
+                # 3. 直ちにローカルファイルを削除（ディスク解放）
+                if os.path.exists(local_file):
+                    os.remove(local_file)
+                    print(f"  -> キャッシュ削除完了: {name}")
 
     target_duration = math.ceil(max(d[2] for d in durations))
 
+    # HLS仕様準拠の m3u8 生成 (バージョンは6以上が推奨)
     m3u8_lines = [
         "#EXTM3U",
-        "#EXT-X-VERSION:4",
+        "#EXT-X-VERSION:6",
         f"#EXT-X-TARGETDURATION:{target_duration}",
         "#EXT-X-PLAYLIST-TYPE:VOD"
     ]
+
+    # init.mp4 が存在した場合は EXT-X-MAP タグを追加
+    if init_asset:
+        init_name = init_asset["name"]
+        init_url = f"https://github.com/{owner}/{repo}/releases/download/{urllib.parse.quote(tag)}/{init_name}"
+        m3u8_lines.append(f'#EXT-X-MAP:URI="{init_url}"')
 
     for name, download_url, dur in durations:
         m3u8_lines.append(f"#EXTINF:{dur:.3f},")
@@ -260,7 +194,7 @@ def main():
     with open(output_filename, "w", encoding="utf-8") as f:
         f.write("\n".join(m3u8_lines) + "\n")
 
-    print(f"\n{output_filename} を正常に作成しました。")
+    print(f"\nすべての解析が完了しました。{output_filename} を作成しました。")
 
 if __name__ == "__main__":
     main()
