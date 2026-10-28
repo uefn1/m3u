@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 実行元リポジトリへの Release 作成・アップロードに必須
+      contents: write # Release 作成・アップロードに必須
 
     steps:
       - name: Checkout repository
@@ -35,26 +35,35 @@ jobs:
         run: |
           python scripts/generate_m3u8.py "${{ inputs.release_url }}"
 
-      # 実行元リポジトリ自身の Release に .m3u8 単体をアップロード（無ければ Release を自動作成）
+      # ファイルの存在を確認し、現在リポジトリの Release にアップロード
       - name: Upload .m3u8 to Current Repo Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          FILE_PATH="${{ github.workspace }}/playlist.m3u8"
+          
+          if [ ! -f "$FILE_PATH" ]; then
+            echo "エラー: $FILE_PATH が見つかりません。"
+            echo "カレントディレクトリ一覧:"
+            ls -la
+            exit 1
+          fi
+
           RELEASE_URL="${{ inputs.release_url }}"
           RAW_TAG=$(echo "$RELEASE_URL" | sed -E 's|https?://github.com/[^/]+/[^/]+/releases/tag/([^/?#]+).*|\1|')
           TAG=$(python3 -c "import urllib.parse, sys; print(urllib.parse.unquote(sys.argv[1]))" "$RAW_TAG")
 
           echo "Target Tag: $TAG"
           echo "Target Repo: ${{ github.repository }}"
+          echo "File Path: $FILE_PATH"
 
-          # 既に同名の Release があれば playlist.m3u8 を追加・上書きアップロード
-          # 無ければ新規に Release を作成して playlist.m3u8 を添付
-          gh release upload "$TAG" playlist.m3u8 --repo "${{ github.repository }}" --clobber || \
-          gh release create "$TAG" playlist.m3u8 --repo "${{ github.repository }}" --title "$TAG" --notes "Generated M3U8 for $TAG"
+          # 既存Releaseへのアップロードを試み、なければ新規作成
+          gh release upload "$TAG" "$FILE_PATH" --repo "${{ github.repository }}" --clobber || \
+          gh release create "$TAG" "$FILE_PATH" --repo "${{ github.repository }}" --title "$TAG" --notes "Generated M3U8 for $TAG"
 
-      # バックアップとして Actions 側の Artifact にも保存（zip形式）
+      # バックアップ用 Artifact
       - name: Upload m3u8 as Artifact (Backup)
         uses: actions/upload-artifact@v4
         with:
           name: playlist-m3u8
-          path: playlist.m3u8
+          path: ${{ github.workspace }}/playlist.m3u8
